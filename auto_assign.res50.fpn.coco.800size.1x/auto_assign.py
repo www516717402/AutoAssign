@@ -71,7 +71,7 @@ class AutoAssign(nn.Module):
         backbone_shape = self.backbone.output_shape()
         feature_shapes = [backbone_shape[f] for f in self.in_features]
         self.head = AutoAssignHead(cfg, feature_shapes)
-        self.shift_generator = cfg.build_shift_generator(cfg, feature_shapes)
+        self.shift_generator = cfg.build_shift_generator(cfg, feature_shapes)  # 计算feature和anchor直接的变换关系
 
         # Matching and loss
         self.shift2box_transform = Shift2BoxTransform(
@@ -92,12 +92,9 @@ class AutoAssign(nn.Module):
             batched_inputs: a list, batched outputs of :class:`DatasetMapper` .
                 Each item in the list contains the inputs for one image.
                 For now, each item in the list is a dict that contains:
-
                 * image: Tensor, image in (C, H, W) format.
                 * instances: Instances
-
                 Other information that's included in the original dicts, such as:
-
                 * "height", "width" (int): the output resolution of the model, used in inference.
                     See :meth:`postprocess` for details.
         Returns:
@@ -162,70 +159,70 @@ class AutoAssign(nn.Module):
             pred_class_probs_per_image, pred_shift_deltas_per_image, \
             pred_obj_probs_per_image in zip(
                 shifts, gt_instances, pred_class_probs, pred_shift_deltas,
-                pred_obj_probs):
-            locations = torch.cat(shifts_per_image, dim=0)
+                pred_obj_probs):  # 单张图进行
+            locations = torch.cat(shifts_per_image, dim=0)  # 所有anchor的中心点
             labels = gt_instances_per_image.gt_classes
             gt_boxes = gt_instances_per_image.gt_boxes
 
             target_shift_deltas = self.shift2box_transform.get_deltas(
-                locations, gt_boxes.tensor.unsqueeze(1))
-            is_in_boxes = target_shift_deltas.min(dim=-1).values > 0
+                locations, gt_boxes.tensor.unsqueeze(1))  # anchor中心点+label-bbox转化为上下左右偏置
+            is_in_boxes = target_shift_deltas.min(dim=-1).values > 0  # 判断anchor是否在bbox内
 
-            foreground_idxs = torch.nonzero(is_in_boxes, as_tuple=True)
+            foreground_idxs = torch.nonzero(is_in_boxes, as_tuple=True)  # 前景idx（anchor在label内）
 
             with torch.no_grad():
                 # predicted_boxes_per_image: a_{j}^{loc}, shape: [j, 4]
                 predicted_boxes_per_image = self.shift2box_transform.apply_deltas(
-                    pred_shift_deltas_per_image, locations)
+                    pred_shift_deltas_per_image, locations)  # 预测的delta_bbox转化为实际的bbox
                 # gt_pred_iou: IoU_{ij}^{loc}, shape: [i, j]
                 gt_pred_iou = pairwise_iou(
                     gt_boxes, Boxes(predicted_boxes_per_image)).max(
                         dim=0, keepdim=True).values.repeat(
-                            len(gt_instances_per_image), 1)
+                            len(gt_instances_per_image), 1)  # gt_bbox和预测bbox之间的iou
 
                 # pred_box_prob_per_image: P{a_{j} \in A_{+}}, shape: [j, c]
                 pred_box_prob_per_image = torch.zeros_like(
                     pred_class_probs_per_image)
-                box_prob = 1 / (1 - gt_pred_iou[foreground_idxs]).clamp_(1e-12)
+                box_prob = 1 / (1 - gt_pred_iou[foreground_idxs]).clamp_(1e-12)  # 获得gt_bbox内的anchoer的1-1/iou
                 for i in range(len(gt_instances_per_image)):
                     idxs = foreground_idxs[0] == i
                     if idxs.sum() > 0:
-                        box_prob[idxs] = normalize(box_prob[idxs])
+                        box_prob[idxs] = normalize(box_prob[idxs])  # 归一化每个目标（每个种类可以有多个目标）的iou
                 pred_box_prob_per_image[foreground_idxs[1],
-                                        labels[foreground_idxs[0]]] = box_prob
+                                        labels[foreground_idxs[0]]] = box_prob  # 生成label的ont-hot格式
                 pred_box_probs.append(pred_box_prob_per_image)
 
             normal_probs = []
             for stride, shifts_i in zip(self.fpn_strides, shifts_per_image):
                 gt_shift_deltas = self.shift2box_transform.get_deltas(
-                    shifts_i, gt_boxes.tensor.unsqueeze(1))
-                distances = (gt_shift_deltas[..., :2] - gt_shift_deltas[..., 2:]) / 2
+                    shifts_i, gt_boxes.tensor.unsqueeze(1))  # bbox偏置
+                distances = (gt_shift_deltas[..., :2] - gt_shift_deltas[..., 2:]) / 2  # 以anchor原点为中心求取（x,y）
                 normal_probs.append(
                     normal_distribution(distances / stride,
                                         self.mu[labels].unsqueeze(1),
-                                        self.sigma[labels].unsqueeze(1)))
+                                        self.sigma[labels].unsqueeze(1)))  # 采用广播形式操作
             normal_probs = torch.cat(normal_probs, dim=1).prod(dim=-1)
 
-            composed_cls_prob = pred_class_probs_per_image[:, labels] * pred_obj_probs_per_image
+            composed_cls_prob = pred_class_probs_per_image[:, labels] * pred_obj_probs_per_image  # cls * confidence 用做联合估计
 
             # matched_gt_shift_deltas: P_{ij}^{loc}
             loss_box_reg = iou_loss(pred_shift_deltas_per_image.unsqueeze(0),
                                     target_shift_deltas,
                                     box_mode="ltrb",
                                     loss_type=self.iou_loss_type,
-                                    reduction="none") * self.reg_weight
-            pred_reg_probs = (-loss_box_reg).exp()
+                                    reduction="none") * self.reg_weight  # 直接计算全部的iou_loss,也就是全部的anchor
+            pred_reg_probs = (-loss_box_reg).exp()  # 对应原论文公式（2）
 
             # positive_losses: { -log( Mean-max(P_{ij}^{cls} * P_{ij}^{loc}) ) }
             positive_losses.append(
-                positive_bag_loss(composed_cls_prob.permute(1, 0) * pred_reg_probs,
-                                  is_in_boxes.float(), normal_probs))
+                positive_bag_loss(composed_cls_prob.permute(1, 0) * pred_reg_probs,  # 将confidence和cls的联合置信度*iou_loss进一步做联合判断（这操作真的可行吗？）
+                                  is_in_boxes.float(), normal_probs))  # 计算正样本的regression，1)label外的样本直接是负样本不进行计算 2）label内的样本安装权重计算
 
-            num_foreground += len(gt_instances_per_image)
-            num_background += normal_probs[foreground_idxs].sum().item()
+            num_foreground += len(gt_instances_per_image)  # gt bboxes 数量
+            num_background += normal_probs[foreground_idxs].sum().item()  # 全部gaussian权重求和
 
             gaussian_norm_losses.append(
-                len(gt_instances_per_image) / normal_probs[foreground_idxs].sum().clamp_(1e-12))
+                len(gt_instances_per_image) / normal_probs[foreground_idxs].sum().clamp_(1e-12))  # gt数量/全部gaussian权重
 
         if dist.is_initialized():
             dist.all_reduce(num_foreground)
@@ -237,7 +234,7 @@ class AutoAssign(nn.Module):
         positive_loss = torch.cat(positive_losses).sum() / max(1, num_foreground)
 
         # pred_box_probs: P{a_{j} \in A_{+}}
-        pred_box_probs = torch.stack(pred_box_probs, dim=0)
+        pred_box_probs = torch.stack(pred_box_probs, dim=0)  # 归一化过后的1/(1-iou)值，值范围[0,1],作为正负样本的权重
         # negative_loss: \sum_{j}{ FL( (1 - P{a_{j} \in A_{+}}) * (1 - P_{j}^{bg}) ) } / n||B||
         negative_loss = negative_bag_loss(
             pred_class_probs * pred_obj_probs * (1 - pred_box_probs),
@@ -245,7 +242,7 @@ class AutoAssign(nn.Module):
 
         loss_pos = positive_loss * self.focal_loss_alpha
         loss_neg = negative_loss * (1 - self.focal_loss_alpha)
-        loss_norm = torch.stack(gaussian_norm_losses).mean() * (1 - self.focal_loss_alpha)
+        loss_norm = torch.stack(gaussian_norm_losses).mean() * (1 - self.focal_loss_alpha)  # 期望让每个gt内的权重之和等于1（归一化过后容易学习）
 
         return {
             "loss_pos": loss_pos,
@@ -261,7 +258,6 @@ class AutoAssign(nn.Module):
                 list of #feature level tensor. The tensor contain shifts of this
                 image on the specific feature level.
             images (ImageList): the input images
-
         Returns:
             results (List[Instances]): a list of #images elements.
         """
@@ -295,7 +291,6 @@ class AutoAssign(nn.Module):
         """
         Single-image inference. Return bounding-box detection results by thresholding
         on scores and applying non-maximum suppression (NMS).
-
         Arguments:
             box_cls (list[Tensor]): list of #feature levels. Each entry contains
                 tensor of size (H x W, K)
@@ -305,7 +300,6 @@ class AutoAssign(nn.Module):
                 a tensor, which contains all the shifts for that
                 image in that feature level.
             image_size (tuple(H, W)): a tuple of the image height and width.
-
         Returns:
             Same as `inference`, but for only one image.
         """
@@ -447,7 +441,6 @@ class AutoAssignHead(nn.Module):
         Arguments:
             features (list[Tensor]): FPN feature map tensors in high to low resolution.
                 Each tensor in the list correspond to different feature levels.
-
         Returns:
             logits (list[Tensor]): #lvl tensors, each has shape (N, K, Hi, Wi).
                 The tensor predicts the classification probability
@@ -462,13 +455,14 @@ class AutoAssignHead(nn.Module):
         obj_logits = []
         for feature, stride, scale in zip(features, self.fpn_strides,
                                           self.scales):
+            # 这里使用的都是共享头，所以需要一个Scale进行尺度变换效果更好
             cls_subnet = self.cls_subnet(feature)
             bbox_subnet = self.bbox_subnet(feature)
 
-            logits.append(self.cls_score(cls_subnet))
-            obj_logits.append(self.obj_score(bbox_subnet))
+            logits.append(self.cls_score(cls_subnet))  # 分类 coco-80
+            obj_logits.append(self.obj_score(bbox_subnet))  # 前景/背景 1
 
-            bbox_pred = scale(self.bbox_pred(bbox_subnet))
+            bbox_pred = scale(self.bbox_pred(bbox_subnet))  # 回归-4（top,bottom,left,right）
             if self.norm_reg_targets:
                 bbox_reg.append(F.relu(bbox_pred) * stride)
             else:
